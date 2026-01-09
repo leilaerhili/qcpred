@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# Virtual environments
+.venv/
+venv/
+
+# OS files
+.DS_Store
+
+# Data artifacts (keep structure, not contents)
+data/raw/*
+data/processed/*
+
+# Allow directory placeholders
+!data/raw/.gitkeep
+!data/processed/.gitkeep

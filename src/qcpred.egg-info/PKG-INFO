@@ -1,0 +1,16 @@
+Metadata-Version: 2.4
+Name: qcpred
+Version: 0.1.0
+Summary: ML-based prediction of quantum circuit performance on real hardware
+Author: Leila Erhili
+Requires-Python: >=3.10
+Description-Content-Type: text/markdown
+Requires-Dist: numpy
+Requires-Dist: pandas
+Provides-Extra: dev
+Requires-Dist: pytest; extra == "dev"
+Requires-Dist: black; extra == "dev"
+Requires-Dist: ruff; extra == "dev"
+
+# qcpred
+ML system that predicts quantum circuit performance on real hardware using circuit-level features and backend noise data, enabling hardware-aware algorithm selection.
