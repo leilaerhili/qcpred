@@ -16,3 +16,6 @@ data/processed/*
 # Allow directory placeholders
 !data/raw/.gitkeep
 !data/processed/.gitkeep
+
+# Python packaging artifacts
+*.egg-info/

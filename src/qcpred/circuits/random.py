@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import random
 from typing import Any, Dict, Tuple
-
+from qcpred.circuits.registry import register
 
 def _qiskit_available() -> bool:
     try:
@@ -104,3 +104,7 @@ def generate_random_circuit(
         meta["representation"] = "stub"
 
     return circuit, meta
+
+
+
+register("random", generate_random_circuit)
