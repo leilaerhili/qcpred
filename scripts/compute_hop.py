@@ -1,0 +1,193 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import json
+from pathlib import Path
+from typing import Any, Dict, List, Tuple
+
+
+def ensure_dir(p: Path) -> None:
+    p.mkdir(parents=True, exist_ok=True)
+
+
+def read_jsonl(path: Path) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    if not path.exists():
+        return rows
+    with path.open("r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            rows.append(json.loads(line))
+    return rows
+
+
+def write_jsonl(path: Path, rows: List[Dict[str, Any]]) -> None:
+    ensure_dir(path.parent)
+    with path.open("w", encoding="utf-8") as f:
+        for r in rows:
+            f.write(json.dumps(r, sort_keys=True) + "\n")
+
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="Compute HOP label for each training row.")
+    p.add_argument(
+        "--in",
+        dest="inp",
+        type=str,
+        default="data/processed/training_rows.jsonl",
+        help="Input training rows JSONL (default: data/processed/training_rows.jsonl)",
+    )
+    p.add_argument(
+        "--out",
+        type=str,
+        default="data/processed/training_rows_with_hop.jsonl",
+        help="Output JSONL (default: data/processed/training_rows_with_hop.jsonl)",
+    )
+    p.add_argument(
+        "--max-qubits",
+        type=int,
+        default=10,
+        help="Safety limit for statevector simulation (default: 10)",
+    )
+    return p.parse_args()
+
+
+def bitstring_probs_from_statevector(qc) -> Dict[str, float]:
+    """
+    Returns probabilities keyed by bitstring like '0101' (Qiskit ordering).
+    Uses Statevector.from_instruction for ideal simulation.
+    """
+    from qiskit.quantum_info import Statevector
+
+    sv = Statevector.from_instruction(qc)
+    probs = sv.probabilities_dict()  # dict: bitstring -> probability
+    # Ensure plain Python floats
+    return {k: float(v) for k, v in probs.items()}
+
+
+def heavy_set_from_probs(probs: Dict[str, float]) -> Tuple[set[str], float]:
+    """
+    Heavy set: outputs with probability strictly greater than the median probability
+    across all 2^n bitstrings (including zeros).
+    """
+    # probs_dict omits zero-prob strings, so we must include zeros to compute true median.
+    # Infer n from any key length. If empty, n=0.
+    if probs:
+        n = len(next(iter(probs.keys())))
+    else:
+        n = 0
+
+    total_states = 1 << n
+    # Build a list of all probabilities including zeros.
+    # For n<=10 this is fine (max 1024).
+    all_probs: List[float] = []
+    for i in range(total_states):
+        b = format(i, f"0{n}b")
+        all_probs.append(probs.get(b, 0.0))
+
+    all_probs_sorted = sorted(all_probs)
+    median = all_probs_sorted[len(all_probs_sorted) // 2]
+
+    heavy = {b for b, p in probs.items() if p > median}
+    # Note: bitstrings not in probs are zero-prob and can't be > median unless median<0 (never).
+    return heavy, float(median)
+
+
+def hop_from_counts(counts: Dict[str, int], heavy: set[str]) -> float:
+    total = sum(int(v) for v in counts.values())
+    if total <= 0:
+        return 0.0
+    heavy_hits = sum(int(v) for k, v in counts.items() if k in heavy)
+    return float(heavy_hits / total)
+
+
+def main() -> int:
+    args = parse_args()
+
+    in_path = Path(args.inp).resolve()
+    out_path = Path(args.out).resolve()
+
+    rows = read_jsonl(in_path)
+    if not rows:
+        print(f"No rows found at: {in_path}")
+        return 1
+
+    from qcpred.datasets.locations import raw_circuits_family_dir
+    from qiskit.qasm2 import load as qasm2_load
+
+    out_rows: List[Dict[str, Any]] = []
+    n_ok = 0
+    n_skip = 0
+
+    for r in rows:
+        family = r.get("family", "random")
+        lf = r.get("logical_features", {})
+        n_qubits = int(lf.get("n_qubits", 0))
+
+        if n_qubits > int(args.max_qubits):
+            r2 = dict(r)
+            r2["hop"] = None
+            r2["hop_meta"] = {"status": "skipped_max_qubits", "n_qubits": n_qubits}
+            out_rows.append(r2)
+            n_skip += 1
+            continue
+
+        artifact_type = r.get("artifact_type")
+        artifact_path = r.get("artifact_path")
+        if artifact_type != "qasm" or not artifact_path:
+            r2 = dict(r)
+            r2["hop"] = None
+            r2["hop_meta"] = {"status": "skipped_no_qasm"}
+            out_rows.append(r2)
+            n_skip += 1
+            continue
+
+        circuits_root = raw_circuits_family_dir(str(family))
+        qasm_path = circuits_root / str(artifact_path)
+
+        if not qasm_path.exists():
+            r2 = dict(r)
+            r2["hop"] = None
+            r2["hop_meta"] = {"status": "missing_qasm", "qasm_path": str(qasm_path)}
+            out_rows.append(r2)
+            n_skip += 1
+            continue
+
+        try:
+            qc = qasm2_load(str(qasm_path))
+            # Ensure measurements exist; Statevector can't handle classical-only ops reliably
+            # If circuit has measurements, strip them for ideal statevector simulation.
+            qc_nom = qc.remove_final_measurements(inplace=False)
+
+            probs = bitstring_probs_from_statevector(qc_nom)
+            heavy, median = heavy_set_from_probs(probs)
+            hop = hop_from_counts(r.get("counts", {}), heavy)
+
+            r2 = dict(r)
+            r2["hop"] = hop
+            r2["hop_meta"] = {
+                "status": "ok",
+                "median_prob": median,
+                "heavy_set_size": len(heavy),
+            }
+            out_rows.append(r2)
+            n_ok += 1
+
+        except Exception as e:
+            r2 = dict(r)
+            r2["hop"] = None
+            r2["hop_meta"] = {"status": "error", "error": f"{type(e).__name__}: {e}"}
+            out_rows.append(r2)
+            n_skip += 1
+
+    write_jsonl(out_path, out_rows)
+    print(f"Wrote {len(out_rows)} rows to: {out_path}")
+    print(f"HOP computed: {n_ok}, skipped/errors: {n_skip}")
+    return 0 if n_ok > 0 else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

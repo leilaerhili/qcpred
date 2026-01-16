@@ -5,8 +5,10 @@ import argparse
 import json
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, List
+
 from qcpred.features.transpiled import extract_transpiled_features, features_to_dict as tf_to_dict
+
 
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -36,9 +38,12 @@ def read_jsonl(path: Path) -> List[Dict[str, Any]]:
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Run circuits on a backend (start: Aer) and record counts.")
+    p = argparse.ArgumentParser(description="Run circuits on Aer and record counts (optionally with a noise model).")
     p.add_argument("--family", type=str, default="random", help="Circuit family (default: random)")
-    p.add_argument("--backend", type=str, default="aer_simulator", help="Backend name tag (default: aer_simulator)")
+
+    # Tag used for output folder naming
+    p.add_argument("--backend", type=str, default="aer_simulator", help="Backend tag for output folder naming")
+
     p.add_argument("--shots", type=int, default=2048, help="Shots per circuit (default: 2048)")
     p.add_argument("--max-circuits", type=int, default=0, help="If >0, limit number of circuits to run")
     p.add_argument("--seed", type=int, default=0, help="Seed for simulator/transpiler (default: 0)")
@@ -48,6 +53,19 @@ def parse_args() -> argparse.Namespace:
         default="",
         help="Output JSONL path. Default: data/raw/results/<family>/<backend>/executions.jsonl",
     )
+
+    # DIY noise model knobs (no IBM packages required)
+    p.add_argument(
+        "--noise",
+        type=str,
+        default="none",
+        choices=["none", "depolarizing"],
+        help="Noise model to apply in Aer (default: none)",
+    )
+    p.add_argument("--p1", type=float, default=0.001, help="1Q depolarizing error prob (default: 0.001)")
+    p.add_argument("--p2", type=float, default=0.01, help="2Q depolarizing error prob (default: 0.01)")
+    p.add_argument("--readout", type=float, default=0.02, help="Readout error prob (default: 0.02)")
+
     return p.parse_args()
 
 
@@ -90,11 +108,35 @@ def main() -> int:
     from qiskit import QuantumCircuit, transpile
     from qiskit.qasm2 import load as qasm2_load
     from qiskit_aer import AerSimulator
+    from qiskit_aer.noise import NoiseModel, ReadoutError, depolarizing_error
 
-    sim = AerSimulator(seed_simulator=int(args.seed))
+    # Build simulator (optionally with noise)
+    noise_mode = args.noise.strip()
+    if noise_mode == "depolarizing":
+        nm = NoiseModel()
+
+        e1 = depolarizing_error(float(args.p1), 1)
+        e2 = depolarizing_error(float(args.p2), 2)
+
+        # Common basis gates post-transpile; harmless if a gate isn't present
+        nm.add_all_qubit_quantum_error(e1, ["x", "y", "z", "h", "sx", "rz", "rx", "ry", "id"])
+        nm.add_all_qubit_quantum_error(e2, ["cx", "cz", "swap"])
+
+        ro = float(args.readout)
+        if ro > 0:
+            nm.add_all_qubit_readout_error(ReadoutError([[1 - ro, ro], [ro, 1 - ro]]))
+
+        sim = AerSimulator(seed_simulator=int(args.seed), noise_model=nm)
+    else:
+        sim = AerSimulator(seed_simulator=int(args.seed))
+
     transpile_settings: Dict[str, Any] = {
         "optimization_level": 1,
         "seed_transpiler": int(args.seed),
+        "noise": noise_mode,
+        "p1": float(args.p1),
+        "p2": float(args.p2),
+        "readout": float(args.readout),
     }
 
     n_ok = 0
@@ -111,10 +153,8 @@ def main() -> int:
             continue
 
         try:
-            # Load QASM2 -> QuantumCircuit
             qc: QuantumCircuit = qasm2_load(str(artifact_path))
 
-            # Transpile for Aer
             tqc = transpile(
                 qc,
                 sim,
@@ -124,7 +164,6 @@ def main() -> int:
 
             tf = extract_transpiled_features(tqc)
 
-            # Run
             job = sim.run(tqc, shots=int(args.shots))
             result = job.result()
             counts = result.get_counts()
@@ -137,7 +176,6 @@ def main() -> int:
                 "timestamp": utc_now_iso(),
                 "transpile_settings": transpile_settings,
                 "counts": counts,
-                # helpful provenance pointers:
                 "artifact_path": str(artifact_rel),
                 "artifact_type": "qasm",
                 "transpiled_features": tf_to_dict(tf),
