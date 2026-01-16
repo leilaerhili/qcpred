@@ -9,16 +9,24 @@ from typing import Any, Dict, List
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Build processed circuit feature dataset from raw circuits manifest.")
-    p.add_argument("--out", type=str, default="data/processed/circuit_features.jsonl", help="Output path (default: data/processed/circuit_features.jsonl)")
+    p.add_argument("--family", type=str, default="random", help="Circuit family (default: random)")
+    p.add_argument(
+        "--out",
+        type=str,
+        default="data/processed/circuit_features.jsonl",
+        help="Output path (default: data/processed/circuit_features.jsonl)",
+    )
     return p.parse_args()
 
 
 def main() -> int:
-    from qcpred.datasets.locations import raw_circuits_dir, raw_circuits_manifest_path
+    args = parse_args()
+
+    from qcpred.datasets.locations import raw_circuits_family_dir, raw_circuits_manifest_path_for
     from qcpred.features.circuit import extract_circuit_features_from_record, features_to_dict
 
-    circuits_root = raw_circuits_dir()
-    manifest_path = raw_circuits_manifest_path()
+    circuits_root = raw_circuits_family_dir(args.family)
+    manifest_path = raw_circuits_manifest_path_for(args.family)
 
     if not manifest_path.exists():
         print(f"No manifest found at: {manifest_path}")
@@ -36,7 +44,7 @@ def main() -> int:
         print("Manifest is empty; nothing to do.")
         return 0
 
-    out_path = Path(parse_args().out).resolve()
+    out_path = Path(args.out).resolve()
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     n_ok = 0

@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import random
 from typing import Any, Dict, Tuple
+
 from qcpred.circuits.registry import register
+
 
 def _qiskit_available() -> bool:
     try:
@@ -19,7 +21,7 @@ def _generate_stub_circuit(
 ) -> Dict[str, Any]:
     """
     Fallback representation when Qiskit is not available.
-    This is JSON-serializable and keeps development unblocked locally.
+    JSON-serializable; keeps development unblocked.
     """
     gates = ["h", "x", "y", "z", "cx"]
 
@@ -33,20 +35,21 @@ def _generate_stub_circuit(
             q = rng.randrange(n_qubits)
             ops.append({"gate": gate, "qubits": [q]})
 
-    return {
-        "n_qubits": n_qubits,
-        "depth": depth,
-        "ops": ops,
-    }
+    return {"n_qubits": n_qubits, "depth_target": depth, "ops": ops}
 
 
 def _generate_qiskit_circuit(
     n_qubits: int,
     depth: int,
     rng: random.Random,
+    *,
+    measure: bool = True,
 ):
     """
     Generate a random QuantumCircuit using Qiskit.
+
+    Note: `depth` here is a *target number of gate insertions*, not the
+    exact Qiskit circuit depth metric.
     """
     from qiskit import QuantumCircuit
 
@@ -62,6 +65,9 @@ def _generate_qiskit_circuit(
             q1, q2 = rng.sample(range(n_qubits), 2)
             qc.cx(q1, q2)
 
+    if measure:
+        qc.measure_all()
+
     return qc
 
 
@@ -75,8 +81,8 @@ def generate_random_circuit(
     """
     Generate a random circuit and return (circuit_object, metadata).
 
-    - If Qiskit is available, circuit_object is a QuantumCircuit
-    - Otherwise, circuit_object is a JSON-serializable dict
+    - If Qiskit is available, circuit_object is a QuantumCircuit (stored as QASM by scripts/generate_circuits.py)
+    - Otherwise, circuit_object is a JSON-serializable dict (stored as JSON)
     """
     rng = random.Random(seed)
 
@@ -93,8 +99,10 @@ def generate_random_circuit(
             n_qubits=n_qubits,
             depth=depth,
             rng=rng,
+            measure=True,
         )
-        meta["representation"] = "qiskit"
+        # scripts/generate_circuits.py will persist this as QASM, so represent it as such.
+        meta["representation"] = "qasm"
     else:
         circuit = _generate_stub_circuit(
             n_qubits=n_qubits,
@@ -104,7 +112,6 @@ def generate_random_circuit(
         meta["representation"] = "stub"
 
     return circuit, meta
-
 
 
 register("random", generate_random_circuit)
