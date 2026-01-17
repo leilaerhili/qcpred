@@ -68,32 +68,36 @@ def bitstring_probs_from_statevector(qc) -> Dict[str, float]:
     return {k: float(v) for k, v in probs.items()}
 
 
-def heavy_set_from_probs(probs: Dict[str, float]) -> Tuple[set[str], float]:
+def heavy_set_from_probs(probs: Dict[str, float], n: int | None = None) -> Tuple[set[str], float]:
     """
-    Heavy set: outputs with probability strictly greater than the median probability
-    across all 2^n bitstrings (including zeros).
+    QV-style heavy set: the top half of bitstrings by ideal probability.
+    Returns (heavy_set, threshold_prob) where threshold_prob is the prob of the last included item.
     """
-    # probs_dict omits zero-prob strings, so we must include zeros to compute true median.
-    # Infer n from any key length. If empty, n=0.
-    if probs:
-        n = len(next(iter(probs.keys())))
-    else:
-        n = 0
+    if n is None:
+        if probs:
+            n = len(next(iter(probs.keys())))
+        else:
+            n = 0
 
     total_states = 1 << n
-    # Build a list of all probabilities including zeros.
-    # For n<=10 this is fine (max 1024).
-    all_probs: List[float] = []
+    if total_states == 0:
+        return set(), 0.0
+
+    # Build full list including zero-prob states so ties are handled consistently
+    items: List[Tuple[str, float]] = []
     for i in range(total_states):
         b = format(i, f"0{n}b")
-        all_probs.append(probs.get(b, 0.0))
+        items.append((b, float(probs.get(b, 0.0))))
 
-    all_probs_sorted = sorted(all_probs)
-    median = all_probs_sorted[len(all_probs_sorted) // 2]
+    # Sort by prob desc, then bitstring to make tie-breaking deterministic
+    items.sort(key=lambda t: (-t[1], t[0]))
 
-    heavy = {b for b, p in probs.items() if p > median}
-    # Note: bitstrings not in probs are zero-prob and can't be > median unless median<0 (never).
-    return heavy, float(median)
+    k = total_states // 2  # heavy set size = 2^(n-1)
+    heavy_items = items[:k]
+    heavy = {b for b, _p in heavy_items}
+    threshold = float(heavy_items[-1][1]) if heavy_items else 0.0
+    return heavy, threshold
+
 
 
 def hop_from_counts(counts: Dict[str, int], heavy: set[str]) -> float:
@@ -163,16 +167,18 @@ def main() -> int:
             qc_nom = qc.remove_final_measurements(inplace=False)
 
             probs = bitstring_probs_from_statevector(qc_nom)
-            heavy, median = heavy_set_from_probs(probs)
+            n = int(lf.get("n_qubits", 0))
+            heavy, thresh = heavy_set_from_probs(probs, n=n)
             hop = hop_from_counts(r.get("counts", {}), heavy)
 
             r2 = dict(r)
             r2["hop"] = hop
             r2["hop_meta"] = {
                 "status": "ok",
-                "median_prob": median,
                 "heavy_set_size": len(heavy),
+                "threshold_prob": thresh,
             }
+
             out_rows.append(r2)
             n_ok += 1
 
