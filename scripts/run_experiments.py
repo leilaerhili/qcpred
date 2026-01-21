@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 
+
 from qcpred.features.transpiled import extract_transpiled_features, features_to_dict as tf_to_dict
 
 
@@ -48,6 +49,30 @@ def parse_p2_grid(s: str) -> List[float]:
     if not out:
         raise ValueError("Empty --p2-grid")
     return out
+
+def parse_float_grid(s: str) -> List[float]:
+    out: List[float] = []
+    for tok in s.split(","):
+        tok = tok.strip()
+        if not tok:
+            continue
+        out.append(float(tok))
+    if not out:
+        raise ValueError("Empty grid")
+    return out
+
+
+def read_backend_profiles(path: Path) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    if not path.exists():
+        return rows
+    with path.open("r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                rows.append(json.loads(line))
+    return rows
+
 
 
 def backend_tag_for_p2(prefix: str, p2: float) -> str:
@@ -95,25 +120,65 @@ def run_one_backend(
     p1: float,
     p2: float,
     readout: float,
+    # New
+    backend_profile_id: Optional[str] = None,
+    lambda_val: Optional[float] = None,
+    coupling_map: Optional[List[List[int]]] = None,
+    basis_gates: Optional[List[str]] = None,
+    # Optional: allow overriding transpile settings 
+    optimization_level: int = 1,
+    seed_transpiler: Optional[int] = None,
+    # Optional: store "base" params for auditability if provided
+    p1_base: Optional[float] = None,
+    p2_base: Optional[float] = None,
+    readout_base: Optional[float] = None,
 ) -> tuple[int, int]:
     """
     Runs qasm_records on Aer, writes execution rows to out_path.
     Returns (n_ok, n_fail).
+
+    B1 additions:
+      - backend_profile_id + lambda stored on each execution row (if provided)
+      - backend_features stored explicitly (numeric features for ML)
+      - transpilation can be constrained via coupling_map + basis_gates to induce
+        backend-dependent transpiled_features (important for B1).
     """
     # Qiskit imports
     from qiskit import QuantumCircuit, transpile
     from qiskit.qasm2 import load as qasm2_load
+    from qiskit.transpiler import CouplingMap
+
+    cm = None
+    if coupling_map is not None:
+        cm = CouplingMap(couplinglist=coupling_map)
+
+    if seed_transpiler is None:
+        seed_transpiler = int(seed)
 
     sim = build_noise_simulator(seed=seed, noise=noise, p1=p1, p2=p2, readout=readout)
 
     transpile_settings: Dict[str, Any] = {
-        "optimization_level": 1,
-        "seed_transpiler": int(seed),
+        "optimization_level": int(optimization_level),
+        "seed_transpiler": int(seed_transpiler),
         "noise": noise,
         "p1": float(p1),
         "p2": float(p2),
         "readout": float(readout),
     }
+
+    # Persist constraints for full reproducibility/auditing
+    if coupling_map is not None:
+        transpile_settings["coupling_map"] = coupling_map
+    if basis_gates is not None:
+        transpile_settings["basis_gates"] = basis_gates
+
+    # If provided, store base params too (useful for lambda sweeps + later hardware parity)
+    if p1_base is not None:
+        transpile_settings["p1_base"] = float(p1_base)
+    if p2_base is not None:
+        transpile_settings["p2_base"] = float(p2_base)
+    if readout_base is not None:
+        transpile_settings["readout_base"] = float(readout_base)
 
     n_ok = 0
     n_fail = 0
@@ -131,9 +196,13 @@ def run_one_backend(
         try:
             qc: QuantumCircuit = qasm2_load(str(artifact_path))
 
+            # IMPORTANT CHANGE:
+            # Transpile with explicit constraints (coupling_map / basis_gates) so that
+            # transpiled features can vary by backend profile.
             tqc = transpile(
                 qc,
-                sim,
+                basis_gates=basis_gates,
+                coupling_map=cm,
                 optimization_level=int(transpile_settings["optimization_level"]),
                 seed_transpiler=int(transpile_settings["seed_transpiler"]),
             )
@@ -156,6 +225,23 @@ def run_one_backend(
                 "artifact_type": "qasm",
                 "transpiled_features": tf_to_dict(tf),
             }
+
+            # NEW: B1 fields
+            if backend_profile_id is not None:
+                exec_record["backend_profile_id"] = str(backend_profile_id)
+            if lambda_val is not None:
+                exec_record["lambda"] = float(lambda_val)
+
+            # NEW: explicit backend_features for ML
+            # (Keep small + numeric; do NOT include backend_profile_id here.)
+            exec_record["backend_features"] = {
+                "p1_base": float(p1_base) if p1_base is not None else None,
+                "p2_base": float(p2_base) if p2_base is not None else None,
+                "readout_base": float(readout_base) if readout_base is not None else None,
+                "optimization_level": int(transpile_settings["optimization_level"]),
+                "noise_model": str(noise),
+            }
+
             append_jsonl(out_path, exec_record)
             n_ok += 1
 
@@ -166,6 +252,7 @@ def run_one_backend(
     print(f"Wrote {n_ok} execution rows to: {out_path}")
     print(f"Failures/skips: {n_fail}")
     return n_ok, n_fail
+
 
 
 def parse_args() -> argparse.Namespace:
@@ -217,6 +304,24 @@ def parse_args() -> argparse.Namespace:
         default="aer_dep",
         help='If sweeping, backend tags become "<prefix>_p2_<value>" (default: aer_dep).',
     )
+    p.add_argument(
+        "--backend-profiles",
+        type=str,
+        default="",
+        help="Backend profiles JSONL (schema v1) for B1 mode.",
+    )
+    p.add_argument(
+        "--lambda-grid",
+        type=str,
+        default="",
+        help='Comma-separated lambda values for B1 sweep (e.g. "0,0.5,1,1.5,2").',
+    )
+    p.add_argument(
+        "--scale-readout",
+        action="store_true",
+        help="If set, readout = lambda * readout_base (default: keep fixed).",
+    )
+
 
     return p.parse_args()
 
@@ -249,6 +354,87 @@ def main() -> int:
     if args.max_circuits and args.max_circuits > 0:
         qasm_records = qasm_records[: int(args.max_circuits)]
 
+        # B1 lambda sweep mode (backend profiles + lambda grid)
+    if args.backend_profiles.strip() and args.lambda_grid.strip():
+        profiles_path = Path(args.backend_profiles).resolve()
+        profiles = read_backend_profiles(profiles_path)
+        if not profiles:
+            print(f"[error] No backend profiles found at: {profiles_path}")
+            return 2
+
+        lambdas = parse_float_grid(args.lambda_grid)
+
+        # B1 sweeps are defined for depolarizing (for now)
+        noise = "depolarizing"
+
+        total_ok = 0
+        total_fail = 0
+
+        for prof in profiles:
+            bpid = str(prof["backend_profile_id"])
+            topo = prof.get("topology", {}) or {}
+            gates = prof.get("gates", {}) or {}
+            nb = prof.get("noise_base", {}) or {}
+            td = prof.get("transpile_defaults", {}) or {}
+            coupling_map = topo.get("coupling_map")
+            basis_gates = gates.get("basis_gates")
+
+            p2_base = float(nb.get("p2_base"))
+            p1_base = float(nb.get("p1_base"))
+            readout_base = float(nb.get("readout_base"))
+            scale_ro = bool(nb.get("scale_readout_with_lambda", False) or args.scale_readout)
+
+            for lam in lambdas:
+                lam = float(lam)
+                p2 = lam * p2_base
+                p1 = lam * p1_base
+                readout = (lam * readout_base) if scale_ro else readout_base
+
+                # Store results under backend_profile_id / lam_x
+                lam_tag = str(lam).replace(".", "p")
+                out_path = repo_path("data", "raw", "results", family, bpid, f"lam_{lam_tag}", "executions.jsonl")
+                
+                opt_level = int(td.get("optimization_level", 1))
+                seed_t = int(td.get("seed_transpiler", args.seed))
+
+
+                print(f"\n=== B1 backend_profile_id={bpid} lambda={lam} p2={p2} p1={p1} readout={readout} ===")
+
+                n_ok, n_fail = run_one_backend(
+                    family=family,
+                    backend_tag=bpid,
+                    qasm_records=qasm_records,
+                    circuits_root=circuits_root,
+                    out_path=out_path,
+                    shots=int(args.shots),
+                    seed=int(args.seed),
+                    noise=noise,
+                    p1=float(p1),
+                    p2=float(p2),
+                    readout=float(readout),
+                    backend_profile_id=bpid,
+                    lambda_val=lam,
+                    coupling_map=coupling_map,
+                    basis_gates=basis_gates,
+                    optimization_level=opt_level,
+                    seed_transpiler=seed_t,
+                    p1_base=p1_base,
+                    p2_base=p2_base,
+                    readout_base=readout_base,
+                )
+
+                # Attach base params to transpile_settings for reproducibility
+                # (They’re stored in backend_features too; but settings are nice for auditing.)
+                # Note: run_one_backend currently constructs transpile_settings internally.
+                # We’ll keep it simple and rely on backend_features + lambda + backend_profiles file.
+
+                total_ok += n_ok
+                total_fail += n_fail
+
+        print(f"\n[B1 sweep done] total_ok={total_ok} total_fail={total_fail}")
+        return 0 if total_ok > 0 else 1
+
+    
     # Sweep mode
     if args.p2_grid.strip():
         p2_vals = parse_p2_grid(args.p2_grid)
